@@ -23,15 +23,24 @@ struct NoPadApp: App {
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var noteWindow: BorderlessKeyWindow?
+    private var keyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        installKeyMonitor()
         makeNoteWindow()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            makeNoteWindow()
+        }
+        return true
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -71,6 +80,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         noteWindow = window
     }
 
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags.contains(.command) else { return event }
+            guard !flags.contains(.option), !flags.contains(.control), !flags.contains(.function), !flags.contains(.shift) else {
+                return event
+            }
+            guard let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
+            guard key == "q" || key == "w" else { return event }
+            self.closeFocusedWindow()
+            return nil
+        }
+    }
+
+    private func closeFocusedWindow() {
+        if let keyWindow = NSApp.keyWindow {
+            keyWindow.close()
+            return
+        }
+        NSApp.windows.last?.close()
+    }
+
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         false
     }
@@ -87,6 +119,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 private final class BorderlessKeyWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isPlainCommand = flags.contains(.command)
+            && !flags.contains(.option)
+            && !flags.contains(.control)
+            && !flags.contains(.function)
+            && !flags.contains(.shift)
+
+        if isPlainCommand, let key = event.charactersIgnoringModifiers?.lowercased(), key == "q" || key == "w" {
+            close()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 @MainActor
@@ -111,10 +158,10 @@ private struct NoPadCommands: Commands {
 
     private func closeFocusedWindow() {
         if let keyWindow = NSApp.keyWindow {
-            keyWindow.performClose(nil)
+            keyWindow.close()
             return
         }
-        NSApp.windows.last?.performClose(nil)
+        NSApp.windows.last?.close()
     }
 }
 
