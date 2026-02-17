@@ -63,8 +63,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
-        window.level = .floating
-        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.level = .statusBar
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 700, height: 460)
         window.isReleasedWhenClosed = false
