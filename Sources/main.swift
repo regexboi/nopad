@@ -231,6 +231,80 @@ private struct GlassSurface: View {
     }
 }
 
+private final class GlowCursorTextView: NSTextView {
+    struct CharacterFade {
+        let location: Int
+        let opacity: CGFloat
+    }
+
+    private var characterFades: [CharacterFade] = []
+
+    func updateCharacterFades(_ fades: [CharacterFade]) {
+        characterFades = fades
+        needsDisplay = true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        if window.firstResponder !== self {
+            window.makeFirstResponder(self)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        drawCharacterFadeOverlay(in: dirtyRect)
+    }
+
+    private func drawCharacterFadeOverlay(in dirtyRect: NSRect) {
+        guard !characterFades.isEmpty else { return }
+        guard let textContainer, let layoutManager else { return }
+
+        let textLength = (string as NSString).length
+        let textOrigin = textContainerOrigin
+
+        for fade in characterFades {
+            guard fade.opacity > 0.01 else { continue }
+            guard fade.location >= 0, fade.location < textLength else { continue }
+
+            let charRange = NSRange(location: fade.location, length: 1)
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: charRange, actualCharacterRange: nil)
+            guard glyphRange.length > 0 else { continue }
+
+            var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+            guard !rect.isNull, !rect.isEmpty else { continue }
+            rect.origin.x += textOrigin.x
+            rect.origin.y += textOrigin.y
+            rect = rect.insetBy(dx: -2.6, dy: -1.8)
+            guard rect.intersects(dirtyRect) else { continue }
+
+            let outerRect = rect.insetBy(dx: -2.8, dy: -1.6)
+            let innerRect = rect.insetBy(dx: -0.8, dy: -0.2)
+
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.compositingOperation = .plusLighter
+
+            let outerShadow = NSShadow()
+            outerShadow.shadowBlurRadius = 8
+            outerShadow.shadowOffset = .zero
+            outerShadow.shadowColor = Theme.shimmer.withAlphaComponent(0.28 * fade.opacity)
+            outerShadow.set()
+            Theme.shimmer.withAlphaComponent(0.06 * fade.opacity).setFill()
+            NSBezierPath(ovalIn: outerRect).fill()
+
+            NSGraphicsContext.restoreGraphicsState()
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.compositingOperation = .plusLighter
+            Theme.shimmer.withAlphaComponent(0.10 * fade.opacity).setFill()
+            NSBezierPath(ovalIn: innerRect).fill()
+
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
+}
+
 @MainActor
 private struct MarkdownEditor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
@@ -247,7 +321,7 @@ private struct MarkdownEditor: NSViewRepresentable {
         textContainer.lineFragmentPadding = 0
         layoutManager.addTextContainer(textContainer)
 
-        let textView = NSTextView(frame: .zero, textContainer: textContainer)
+        let textView = GlowCursorTextView(frame: .zero, textContainer: textContainer)
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
@@ -273,9 +347,6 @@ private struct MarkdownEditor: NSViewRepresentable {
         context.coordinator.styler.attach(textView: textView, storage: textStorage)
         textStorage.delegate = context.coordinator.styler
         context.coordinator.styler.applyStyles()
-        DispatchQueue.main.async {
-            textView.window?.makeFirstResponder(textView)
-        }
 
         let scrollView = NSScrollView()
         scrollView.borderType = .noBorder
@@ -304,13 +375,20 @@ private final class MarkdownStyler: NSObject, @preconcurrency NSTextStorageDeleg
         ]
     }
 
-    private weak var textView: NSTextView?
+    private struct CharacterFadeState {
+        var location: Int
+        var startedAt: TimeInterval
+    }
+
+    private weak var glowTextView: GlowCursorTextView?
     private weak var storage: NSTextStorage?
     private var isApplyingStyles = false
     private var styleUpdateScheduled = false
+    private var activeCharacterFades: [CharacterFadeState] = []
+    private var shimmerTimer: Timer?
 
     func attach(textView: NSTextView, storage: NSTextStorage) {
-        self.textView = textView
+        self.glowTextView = textView as? GlowCursorTextView
         self.storage = storage
     }
 
@@ -321,6 +399,7 @@ private final class MarkdownStyler: NSObject, @preconcurrency NSTextStorageDeleg
         changeInLength delta: Int
     ) {
         guard editedMask.contains(.editedCharacters) else { return }
+        registerCharacterFades(from: textStorage, editedRange: editedRange, delta: delta)
         scheduleStyleUpdate()
     }
 
@@ -332,6 +411,122 @@ private final class MarkdownStyler: NSObject, @preconcurrency NSTextStorageDeleg
             self.styleUpdateScheduled = false
             self.applyStyles()
         }
+    }
+
+    private func registerCharacterFades(from textStorage: NSTextStorage, editedRange: NSRange, delta: Int) {
+        rebaseCharacterFades(editedRange: editedRange, delta: delta)
+
+        guard editedRange.length > 0 else {
+            if activeCharacterFades.isEmpty {
+                glowTextView?.updateCharacterFades([])
+                stopShimmerTimer()
+            }
+            return
+        }
+
+        let source = textStorage.string as NSString
+        let upper = min(source.length, editedRange.location + editedRange.length)
+        guard editedRange.location < upper else { return }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        for location in editedRange.location..<upper {
+            let character = Self.characterAt(location, in: source)
+            guard !character.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            activeCharacterFades.removeAll { $0.location == location }
+            activeCharacterFades.append(CharacterFadeState(location: location, startedAt: now))
+        }
+
+        if activeCharacterFades.isEmpty {
+            glowTextView?.updateCharacterFades([])
+            stopShimmerTimer()
+            return
+        }
+
+        ensureShimmerTimer()
+        tickCharacterFades()
+    }
+
+    private func rebaseCharacterFades(editedRange: NSRange, delta: Int) {
+        guard !activeCharacterFades.isEmpty else { return }
+
+        let oldEditedLength = max(0, editedRange.length - delta)
+        let oldEditedRange = NSRange(location: editedRange.location, length: oldEditedLength)
+        let oldEditedEnd = oldEditedRange.location + oldEditedRange.length
+
+        activeCharacterFades = activeCharacterFades.compactMap { fade in
+            if NSLocationInRange(fade.location, oldEditedRange) {
+                return nil
+            }
+
+            var shifted = fade.location
+            if shifted >= oldEditedEnd {
+                shifted += delta
+            }
+
+            guard shifted >= 0 else { return nil }
+            return CharacterFadeState(location: shifted, startedAt: fade.startedAt)
+        }
+    }
+
+    private static func characterAt(_ index: Int, in source: NSString) -> String {
+        source.substring(with: NSRange(location: index, length: 1))
+    }
+
+    private func ensureShimmerTimer() {
+        guard shimmerTimer == nil else { return }
+        shimmerTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tickCharacterFades()
+            }
+        }
+        RunLoop.main.add(shimmerTimer!, forMode: .common)
+    }
+
+    private func stopShimmerTimer() {
+        shimmerTimer?.invalidate()
+        shimmerTimer = nil
+    }
+
+    private func tickCharacterFades() {
+        guard let glowTextView else {
+            activeCharacterFades.removeAll()
+            stopShimmerTimer()
+            return
+        }
+        guard let storage else {
+            glowTextView.updateCharacterFades([])
+            activeCharacterFades.removeAll()
+            stopShimmerTimer()
+            return
+        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let textLength = storage.length
+        var nextStates: [CharacterFadeState] = []
+        var renderStates: [GlowCursorTextView.CharacterFade] = []
+
+        for fade in activeCharacterFades {
+            guard fade.location >= 0, fade.location < textLength else { continue }
+
+            let elapsed = now - fade.startedAt
+            let progress = CGFloat(elapsed / Theme.characterFadeDuration)
+            guard progress < 1 else { continue }
+
+            let opacity = pow(1 - progress, 1.6)
+            nextStates.append(fade)
+            renderStates.append(GlowCursorTextView.CharacterFade(location: fade.location, opacity: opacity))
+        }
+
+        activeCharacterFades = nextStates
+
+        if renderStates.isEmpty {
+            glowTextView.updateCharacterFades([])
+            stopShimmerTimer()
+            return
+        }
+
+        glowTextView.updateCharacterFades(renderStates)
     }
 
     func applyStyles() {
@@ -370,6 +565,7 @@ private final class MarkdownStyler: NSObject, @preconcurrency NSTextStorageDeleg
                 range: markerRange
             )
         }
+
         storage.endEditing()
     }
 
@@ -419,13 +615,16 @@ private struct VisualEffect: NSViewRepresentable {
 @MainActor
 private enum Theme {
     static let accent = NSColor(hex: "#b44dff")
-    static let cursor = NSColor(hex: "#e0aaff")
+    static let cursor = NSColor(hex: "#ffd400")
+    static let shimmer = NSColor(hex: "#ffe866")
     static let background = NSColor(hex: "#1a0533")
     static let foreground = NSColor(hex: "#e8e0f0")
     static let blue = NSColor(hex: "#7b5eff")
     static let magenta = NSColor(hex: "#ff59d6")
     static let cyan = NSColor(hex: "#00e5ff")
     static let brightWhite = NSColor(hex: "#ffffff")
+    static let cursorWidth: CGFloat = 6.0
+    static let characterFadeDuration: TimeInterval = 0.28
 
     static var bodyFont: NSFont {
         NSFont.monospacedSystemFont(ofSize: 18, weight: .regular)
