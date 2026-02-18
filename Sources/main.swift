@@ -257,6 +257,37 @@ private final class GlowCursorTextView: NSTextView {
         drawCharacterFadeOverlay(in: dirtyRect)
     }
 
+    override func mouseDown(with event: NSEvent) {
+        guard shouldTreatMouseDownAsWindowDrag(event) else {
+            super.mouseDown(with: event)
+            return
+        }
+        window?.performDrag(with: event)
+    }
+
+    private func shouldTreatMouseDownAsWindowDrag(_ event: NSEvent) -> Bool {
+        guard event.type == .leftMouseDown else { return false }
+        guard !event.modifierFlags.contains(.option), !event.modifierFlags.contains(.command) else { return false }
+        guard !event.modifierFlags.contains(.control), !event.modifierFlags.contains(.shift) else { return false }
+        return !isPointOverRenderedGlyph(convert(event.locationInWindow, from: nil))
+    }
+
+    private func isPointOverRenderedGlyph(_ point: NSPoint) -> Bool {
+        guard let textContainer, let layoutManager else { return false }
+
+        let containerPoint = NSPoint(
+            x: point.x - textContainerOrigin.x,
+            y: point.y - textContainerOrigin.y
+        )
+
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        guard usedRect.contains(containerPoint) else { return false }
+
+        let probeRect = CGRect(origin: containerPoint, size: CGSize(width: 1, height: 1))
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: probeRect, in: textContainer)
+        return glyphRange.length > 0
+    }
+
     private func drawCharacterFadeOverlay(in dirtyRect: NSRect) {
         guard !characterFades.isEmpty else { return }
         guard let textContainer, let layoutManager else { return }
