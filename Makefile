@@ -10,13 +10,14 @@ APP_CONTENTS := $(APP_BUNDLE)/Contents
 APP_BIN := $(APP_CONTENTS)/MacOS/$(APP_NAME)
 INSTALL_PATH := /Applications/$(APP_NAME).app
 
-.PHONY: help release bundle sign install open clean uninstall
+.PHONY: help release bundle sign stop install open clean uninstall
 
 help:
 	@echo "Targets:"
 	@echo "  make release   Build release binary"
 	@echo "  make bundle    Create /tmp/$(APP_NAME).app bundle"
 	@echo "  make sign      Ad-hoc sign app bundle"
+	@echo "  make stop      Stop running $(APP_NAME) process"
 	@echo "  make install   Install signed app to /Applications"
 	@echo "  make open      Install and launch app"
 	@echo "  make uninstall Remove /Applications/$(APP_NAME).app"
@@ -56,7 +57,15 @@ bundle: release
 sign: bundle
 	codesign --force --deep --sign - "$(APP_BUNDLE)"
 
-install: sign
+stop:
+	@osascript -e 'tell application id "$(BUNDLE_ID)" to quit' >/dev/null 2>&1 || true
+	@for i in 1 2 3 4 5; do \
+		pgrep -f "$(INSTALL_PATH)/Contents/MacOS/$(APP_NAME)" >/dev/null || break; \
+		sleep 0.2; \
+	done
+	@pkill -f "$(INSTALL_PATH)/Contents/MacOS/$(APP_NAME)" >/dev/null 2>&1 || true
+
+install: sign stop
 	rm -rf "$(INSTALL_PATH)"
 	cp -R "$(APP_BUNDLE)" "$(INSTALL_PATH)"
 	@echo "Installed to $(INSTALL_PATH)"
