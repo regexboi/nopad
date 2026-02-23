@@ -20,16 +20,111 @@ struct NoPadApp: App {
     }
 }
 
+private extension Notification.Name {
+    static let noPadOpenNewWindow = Notification.Name("NoPad.OpenNewWindow")
+    static let noPadDeleteFocusedWindow = Notification.Name("NoPad.DeleteFocusedWindow")
+}
+
+private actor NoteStore {
+    struct StoredNote: Sendable {
+        let id: UUID
+        let text: String
+    }
+
+    private struct NotesIndex: Codable {
+        var ids: [UUID]
+    }
+
+    private let fileManager = FileManager.default
+    private let storageDirectoryURL: URL
+    private let indexURL: URL
+
+    init() {
+        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.regexboi.nopad"
+        storageDirectoryURL = appSupportURL
+            .appendingPathComponent(bundleIdentifier, isDirectory: true)
+            .appendingPathComponent("Notes", isDirectory: true)
+        indexURL = storageDirectoryURL.appendingPathComponent("index.json", isDirectory: false)
+    }
+
+    func loadNotes() -> [StoredNote] {
+        ensureStorageDirectory()
+        let noteIDs = loadIndex()
+        return noteIDs.map { StoredNote(id: $0, text: loadText(for: $0)) }
+    }
+
+    func createNote() -> StoredNote {
+        ensureStorageDirectory()
+        var noteIDs = loadIndex()
+        let noteID = UUID()
+        noteIDs.append(noteID)
+        saveIndex(noteIDs)
+        writeText("", for: noteID)
+        return StoredNote(id: noteID, text: "")
+    }
+
+    func saveText(_ text: String, for noteID: UUID) {
+        ensureStorageDirectory()
+        let noteIDs = loadIndex()
+        guard noteIDs.contains(noteID) else { return }
+        writeText(text, for: noteID)
+    }
+
+    func deleteNote(_ noteID: UUID) {
+        ensureStorageDirectory()
+        var noteIDs = loadIndex()
+        noteIDs.removeAll { $0 == noteID }
+        saveIndex(noteIDs)
+        try? fileManager.removeItem(at: noteURL(for: noteID))
+    }
+
+    private func ensureStorageDirectory() {
+        try? fileManager.createDirectory(at: storageDirectoryURL, withIntermediateDirectories: true)
+    }
+
+    private func loadIndex() -> [UUID] {
+        guard let data = try? Data(contentsOf: indexURL) else { return [] }
+        guard let decoded = try? JSONDecoder().decode(NotesIndex.self, from: data) else { return [] }
+        return decoded.ids
+    }
+
+    private func saveIndex(_ noteIDs: [UUID]) {
+        let payload = NotesIndex(ids: noteIDs)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        try? data.write(to: indexURL, options: .atomic)
+    }
+
+    private func loadText(for noteID: UUID) -> String {
+        (try? String(contentsOf: noteURL(for: noteID), encoding: .utf8)) ?? ""
+    }
+
+    private func writeText(_ text: String, for noteID: UUID) {
+        try? text.write(to: noteURL(for: noteID), atomically: true, encoding: .utf8)
+    }
+
+    private func noteURL(for noteID: UUID) -> URL {
+        storageDirectoryURL.appendingPathComponent("\(noteID.uuidString).md", isDirectory: false)
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private var noteWindow: BorderlessKeyWindow?
+    private let noteStore = NoteStore()
+    private var noteWindows: [UUID: BorderlessKeyWindow] = [:]
+    private var isTerminating = false
     private var keyMonitor: Any?
+    private var newWindowObserver: Any?
+    private var deleteWindowObserver: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
-        makeNoteWindow()
+        installNewWindowObserver()
+        installDeleteWindowObserver()
+        restorePersistedNotes()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -37,21 +132,65 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            makeNoteWindow()
-        }
+        requestNewNoteWindow()
         return true
     }
 
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.isEmpty == false else { return }
+        requestNewNoteWindow()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        isTerminating = true
+        return .terminateNow
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        isTerminating = true
+    }
+
     func windowWillClose(_ notification: Notification) {
-        guard let closedWindow = notification.object as? NSWindow else { return }
-        if closedWindow == noteWindow {
-            noteWindow = nil
+        guard let closedWindow = notification.object as? BorderlessKeyWindow else { return }
+        noteWindows.removeValue(forKey: closedWindow.noteID)
+        guard !isTerminating else { return }
+
+        let noteID = closedWindow.noteID
+        Task {
+            await noteStore.deleteNote(noteID)
         }
     }
 
-    private func makeNoteWindow() {
+    private func restorePersistedNotes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let notes = await noteStore.loadNotes()
+            if notes.isEmpty {
+                await createAndShowNewNoteWindow()
+                return
+            }
+
+            for note in notes {
+                makeNoteWindow(note: note)
+            }
+        }
+    }
+
+    private func requestNewNoteWindow() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await createAndShowNewNoteWindow()
+        }
+    }
+
+    private func createAndShowNewNoteWindow() async {
+        let note = await noteStore.createNote()
+        makeNoteWindow(note: note)
+    }
+
+    private func makeNoteWindow(note: NoteStore.StoredNote) {
         let window = BorderlessKeyWindow(
+            noteID: note.id,
             contentRect: NSRect(x: 0, y: 0, width: 920, height: 620),
             styleMask: [.borderless, .resizable],
             backing: .buffered,
@@ -71,37 +210,77 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.isReleasedWhenClosed = false
         window.center()
 
-        let hostingView = NSHostingView(rootView: NoteWindowView())
+        let hostingView = NSHostingView(
+            rootView: NoteWindowView(
+                initialText: note.text,
+                onTextChange: { [weak self] text in
+                    self?.persistText(text, for: note.id)
+                }
+            )
+        )
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = hostingView
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        noteWindow = window
+        noteWindows[note.id] = window
+    }
+
+    private func persistText(_ text: String, for noteID: UUID) {
+        Task {
+            await noteStore.saveText(text, for: noteID)
+        }
     }
 
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard flags.contains(.command) else { return event }
-            guard !flags.contains(.option), !flags.contains(.control), !flags.contains(.function), !flags.contains(.shift) else {
-                return event
-            }
             guard let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
-            guard key == "q" || key == "w" else { return event }
-            self.closeFocusedWindow()
+            guard key == "w", flags.contains(.command) else { return event }
+            guard !flags.contains(.option), !flags.contains(.control), !flags.contains(.function) else { return event }
+
+            if flags.contains(.shift) {
+                self.closeFocusedWindowAndDeleteNote()
+                return nil
+            }
+
+            // Reserve Cmd+W to avoid accidental permanent deletion.
             return nil
         }
     }
 
-    private func closeFocusedWindow() {
-        if let keyWindow = NSApp.keyWindow {
+    private func installNewWindowObserver() {
+        newWindowObserver = NotificationCenter.default.addObserver(
+            forName: .noPadOpenNewWindow,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestNewNoteWindow()
+            }
+        }
+    }
+
+    private func installDeleteWindowObserver() {
+        deleteWindowObserver = NotificationCenter.default.addObserver(
+            forName: .noPadDeleteFocusedWindow,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.closeFocusedWindowAndDeleteNote()
+            }
+        }
+    }
+
+    private func closeFocusedWindowAndDeleteNote() {
+        if let keyWindow = NSApp.keyWindow as? BorderlessKeyWindow {
             keyWindow.close()
             return
         }
-        NSApp.windows.last?.close()
+        noteWindows.values.first?.close()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -118,56 +297,48 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 }
 
 private final class BorderlessKeyWindow: NSWindow {
+    let noteID: UUID
+
+    init(
+        noteID: UUID,
+        contentRect: NSRect,
+        styleMask style: NSWindow.StyleMask,
+        backing bufferingType: NSWindow.BackingStoreType,
+        defer flag: Bool
+    ) {
+        self.noteID = noteID
+        super.init(contentRect: contentRect, styleMask: style, backing: bufferingType, defer: flag)
+    }
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let isPlainCommand = flags.contains(.command)
-            && !flags.contains(.option)
-            && !flags.contains(.control)
-            && !flags.contains(.function)
-            && !flags.contains(.shift)
-
-        if isPlainCommand, let key = event.charactersIgnoringModifiers?.lowercased(), key == "q" || key == "w" {
-            close()
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
 }
 
 @MainActor
 private struct NoPadCommands: Commands {
     var body: some Commands {
-        CommandGroup(replacing: .newItem) { }
+        CommandGroup(replacing: .newItem) {
+            Button("New Note Window") {
+                NotificationCenter.default.post(name: .noPadOpenNewWindow, object: nil)
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+        }
         CommandGroup(replacing: .saveItem) { }
         CommandGroup(replacing: .importExport) { }
-        CommandGroup(replacing: .appTermination) {
-            Button("Close Focused Note") {
-                closeFocusedWindow()
-            }
-            .keyboardShortcut("q", modifiers: [.command])
-        }
         CommandGroup(after: .windowArrangement) {
-            Button("Close Focused Note") {
-                closeFocusedWindow()
+            Button("Delete Focused Note") {
+                NotificationCenter.default.post(name: .noPadDeleteFocusedWindow, object: nil)
             }
-            .keyboardShortcut("w", modifiers: [.command])
+            .keyboardShortcut("w", modifiers: [.command, .shift])
         }
-    }
-
-    private func closeFocusedWindow() {
-        if let keyWindow = NSApp.keyWindow {
-            keyWindow.close()
-            return
-        }
-        NSApp.windows.last?.close()
     }
 }
 
 @MainActor
 private struct NoteWindowView: View {
+    let initialText: String
+    let onTextChange: (String) -> Void
+
     var body: some View {
         ZStack {
             GlassSurface()
@@ -179,7 +350,7 @@ private struct NoteWindowView: View {
                     .padding(.top, 14)
                     .padding(.bottom, 18)
 
-                MarkdownEditor()
+                MarkdownEditor(initialText: initialText, onTextChange: onTextChange)
                     .padding(.horizontal, 24)
                     .padding(.bottom, 22)
             }
@@ -338,8 +509,11 @@ private final class GlowCursorTextView: NSTextView {
 
 @MainActor
 private struct MarkdownEditor: NSViewRepresentable {
+    let initialText: String
+    let onTextChange: (String) -> Void
+
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onTextChange: onTextChange)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -374,6 +548,13 @@ private struct MarkdownEditor: NSViewRepresentable {
         textView.importsGraphics = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.smartInsertDeleteEnabled = false
+        textView.delegate = context.coordinator
+
+        if !initialText.isEmpty {
+            textStorage.setAttributedString(
+                NSAttributedString(string: initialText, attributes: MarkdownStyler.baseAttributes)
+            )
+        }
 
         context.coordinator.styler.attach(textView: textView, storage: textStorage)
         textStorage.delegate = context.coordinator.styler
@@ -391,8 +572,18 @@ private struct MarkdownEditor: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) { }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         let styler = MarkdownStyler()
+        private let onTextChange: (String) -> Void
+
+        init(onTextChange: @escaping (String) -> Void) {
+            self.onTextChange = onTextChange
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            onTextChange(textView.string)
+        }
     }
 }
 
