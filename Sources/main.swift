@@ -433,7 +433,14 @@ private final class GlowCursorTextView: NSTextView {
             super.mouseDown(with: event)
             return
         }
+        if let window, !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
         window?.performDrag(with: event)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
     private func shouldTreatMouseDownAsWindowDrag(_ event: NSEvent) -> Bool {
