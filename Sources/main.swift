@@ -111,6 +111,7 @@ private actor NoteStore {
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private static let launchOffsetFromCenterX: CGFloat = 140
     private let noteStore = NoteStore()
     private var noteWindows: [UUID: BorderlessKeyWindow] = [:]
     private var isTerminating = false
@@ -208,7 +209,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 700, height: 460)
         window.isReleasedWhenClosed = false
-        window.center()
+        positionWindowSlightlyRightOfCenter(window)
 
         let hostingView = NSHostingView(
             rootView: NoteWindowView(
@@ -225,6 +226,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         noteWindows[note.id] = window
+    }
+
+    private func positionWindowSlightlyRightOfCenter(_ window: NSWindow) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            window.center()
+            return
+        }
+
+        let visibleFrame = screen.visibleFrame
+        let windowSize = window.frame.size
+        let centeredX = visibleFrame.midX - (windowSize.width / 2)
+        let centeredY = visibleFrame.midY - (windowSize.height / 2)
+        let desiredX = centeredX + Self.launchOffsetFromCenterX
+
+        let minX = visibleFrame.minX
+        let maxX = visibleFrame.maxX - windowSize.width
+        let minY = visibleFrame.minY
+        let maxY = visibleFrame.maxY - windowSize.height
+        let originX = min(max(desiredX, minX), maxX)
+        let originY = min(max(centeredY, minY), maxY)
+
+        window.setFrameOrigin(NSPoint(x: originX, y: originY))
     }
 
     private func persistText(_ text: String, for noteID: UUID) {
@@ -246,7 +269,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 return nil
             }
 
-            // Reserve Cmd+W to avoid accidental permanent deletion.
+            self.closeFocusedWindowAndDeleteNote()
             return nil
         }
     }
