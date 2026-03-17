@@ -26,13 +26,56 @@ private extension Notification.Name {
 }
 
 private actor NoteStore {
+    struct WindowFrame: Codable, Equatable, Sendable {
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+
+        init(_ rect: CGRect) {
+            x = rect.origin.x
+            y = rect.origin.y
+            width = rect.size.width
+            height = rect.size.height
+        }
+
+        var rect: CGRect {
+            CGRect(x: x, y: y, width: width, height: height)
+        }
+    }
+
     struct StoredNote: Sendable {
         let id: UUID
         let text: String
+        let windowFrame: WindowFrame?
+        let isPinned: Bool
     }
 
     private struct NotesIndex: Codable {
+        var notes: [NoteMetadata]
+    }
+
+    private struct LegacyNotesIndex: Codable {
         var ids: [UUID]
+    }
+
+    private struct NoteMetadata: Codable {
+        let id: UUID
+        var windowFrame: WindowFrame?
+        var isPinned: Bool
+
+        init(id: UUID, windowFrame: WindowFrame?, isPinned: Bool = false) {
+            self.id = id
+            self.windowFrame = windowFrame
+            self.isPinned = isPinned
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(UUID.self, forKey: .id)
+            windowFrame = try container.decodeIfPresent(WindowFrame.self, forKey: .windowFrame)
+            isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        }
     }
 
     private let fileManager = FileManager.default
@@ -51,32 +94,56 @@ private actor NoteStore {
 
     func loadNotes() -> [StoredNote] {
         ensureStorageDirectory()
-        let noteIDs = loadIndex()
-        return noteIDs.map { StoredNote(id: $0, text: loadText(for: $0)) }
+        let notes = loadIndex()
+        return notes.map {
+            StoredNote(id: $0.id, text: loadText(for: $0.id), windowFrame: $0.windowFrame, isPinned: $0.isPinned)
+        }
     }
 
     func createNote() -> StoredNote {
         ensureStorageDirectory()
-        var noteIDs = loadIndex()
+        var notes = loadIndex()
         let noteID = UUID()
-        noteIDs.append(noteID)
-        saveIndex(noteIDs)
+        notes.append(NoteMetadata(id: noteID, windowFrame: nil, isPinned: false))
+        saveIndex(notes)
         writeText("", for: noteID)
-        return StoredNote(id: noteID, text: "")
+        return StoredNote(id: noteID, text: "", windowFrame: nil, isPinned: false)
     }
 
     func saveText(_ text: String, for noteID: UUID) {
         ensureStorageDirectory()
-        let noteIDs = loadIndex()
-        guard noteIDs.contains(noteID) else { return }
+        let notes = loadIndex()
+        guard notes.contains(where: { $0.id == noteID }) else { return }
         writeText(text, for: noteID)
+    }
+
+    func saveWindowFrame(_ frame: CGRect, for noteID: UUID) {
+        ensureStorageDirectory()
+        var notes = loadIndex()
+        guard let noteIndex = notes.firstIndex(where: { $0.id == noteID }) else { return }
+
+        let storedFrame = WindowFrame(frame)
+        guard notes[noteIndex].windowFrame != storedFrame else { return }
+
+        notes[noteIndex].windowFrame = storedFrame
+        saveIndex(notes)
+    }
+
+    func savePinnedState(_ isPinned: Bool, for noteID: UUID) {
+        ensureStorageDirectory()
+        var notes = loadIndex()
+        guard let noteIndex = notes.firstIndex(where: { $0.id == noteID }) else { return }
+        guard notes[noteIndex].isPinned != isPinned else { return }
+
+        notes[noteIndex].isPinned = isPinned
+        saveIndex(notes)
     }
 
     func deleteNote(_ noteID: UUID) {
         ensureStorageDirectory()
-        var noteIDs = loadIndex()
-        noteIDs.removeAll { $0 == noteID }
-        saveIndex(noteIDs)
+        var notes = loadIndex()
+        notes.removeAll { $0.id == noteID }
+        saveIndex(notes)
         try? fileManager.removeItem(at: noteURL(for: noteID))
     }
 
@@ -84,14 +151,23 @@ private actor NoteStore {
         try? fileManager.createDirectory(at: storageDirectoryURL, withIntermediateDirectories: true)
     }
 
-    private func loadIndex() -> [UUID] {
+    private func loadIndex() -> [NoteMetadata] {
         guard let data = try? Data(contentsOf: indexURL) else { return [] }
-        guard let decoded = try? JSONDecoder().decode(NotesIndex.self, from: data) else { return [] }
-        return decoded.ids
+        let decoder = JSONDecoder()
+
+        if let decoded = try? decoder.decode(NotesIndex.self, from: data) {
+            return decoded.notes
+        }
+
+        if let decoded = try? decoder.decode(LegacyNotesIndex.self, from: data) {
+            return decoded.ids.map { NoteMetadata(id: $0, windowFrame: nil, isPinned: false) }
+        }
+
+        return []
     }
 
-    private func saveIndex(_ noteIDs: [UUID]) {
-        let payload = NotesIndex(ids: noteIDs)
+    private func saveIndex(_ notes: [NoteMetadata]) {
+        let payload = NotesIndex(notes: notes)
         guard let data = try? JSONEncoder().encode(payload) else { return }
         try? data.write(to: indexURL, options: .atomic)
     }
@@ -114,6 +190,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private static let launchOffsetFromCenterX: CGFloat = 140
     private let noteStore = NoteStore()
     private var noteWindows: [UUID: BorderlessKeyWindow] = [:]
+    private var pendingDeleteConfirmationWindowIDs: Set<UUID> = []
     private var isTerminating = false
     private var keyMonitor: Any?
     private var newWindowObserver: Any?
@@ -153,6 +230,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     func windowWillClose(_ notification: Notification) {
         guard let closedWindow = notification.object as? BorderlessKeyWindow else { return }
+        pendingDeleteConfirmationWindowIDs.remove(closedWindow.noteID)
         noteWindows.removeValue(forKey: closedWindow.noteID)
         guard !isTerminating else { return }
 
@@ -160,6 +238,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         Task {
             await noteStore.deleteNote(noteID)
         }
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        persistWindowFrame(from: notification)
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        persistWindowFrame(from: notification)
     }
 
     private func restorePersistedNotes() {
@@ -203,19 +289,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
-        window.level = .statusBar
+        window.level = .normal
         window.hidesOnDeactivate = false
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 700, height: 460)
         window.isReleasedWhenClosed = false
-        positionWindowSlightlyRightOfCenter(window)
+        applyPinnedState(note.isPinned, to: window)
+        if let storedFrame = note.windowFrame, restoreWindow(window, to: storedFrame) == false {
+            positionWindowSlightlyRightOfCenter(window)
+        } else if note.windowFrame == nil {
+            positionWindowSlightlyRightOfCenter(window)
+        }
 
         let hostingView = NSHostingView(
             rootView: NoteWindowView(
                 initialText: note.text,
+                initialIsPinned: note.isPinned,
                 onTextChange: { [weak self] text in
                     self?.persistText(text, for: note.id)
+                },
+                onPinChange: { [weak self] isPinned in
+                    self?.updatePinnedState(isPinned, for: note.id)
                 }
             )
         )
@@ -250,10 +345,46 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.setFrameOrigin(NSPoint(x: originX, y: originY))
     }
 
+    private func restoreWindow(_ window: NSWindow, to storedFrame: NoteStore.WindowFrame) -> Bool {
+        let frame = storedFrame.rect
+        guard frame.width >= window.minSize.width, frame.height >= window.minSize.height else {
+            return false
+        }
+
+        guard NSScreen.screens.contains(where: { $0.visibleFrame.contains(frame) }) else {
+            return false
+        }
+
+        window.setFrame(frame, display: false)
+        return true
+    }
+
     private func persistText(_ text: String, for noteID: UUID) {
         Task {
             await noteStore.saveText(text, for: noteID)
         }
+    }
+
+    private func updatePinnedState(_ isPinned: Bool, for noteID: UUID) {
+        guard let window = noteWindows[noteID] else { return }
+        applyPinnedState(isPinned, to: window)
+
+        Task {
+            await noteStore.savePinnedState(isPinned, for: noteID)
+        }
+    }
+
+    private func persistWindowFrame(from notification: Notification) {
+        guard let window = notification.object as? BorderlessKeyWindow else { return }
+
+        let frame = window.frame
+        Task {
+            await noteStore.saveWindowFrame(frame, for: window.noteID)
+        }
+    }
+
+    private func applyPinnedState(_ isPinned: Bool, to window: NSWindow) {
+        window.level = isPinned ? .floating : .normal
     }
 
     private func installKeyMonitor() {
@@ -265,11 +396,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             guard !flags.contains(.option), !flags.contains(.control), !flags.contains(.function) else { return event }
 
             if flags.contains(.shift) {
-                self.closeFocusedWindowAndDeleteNote()
+                self.requestDeleteFocusedWindowConfirmation()
                 return nil
             }
 
-            self.closeFocusedWindowAndDeleteNote()
+            self.requestDeleteFocusedWindowConfirmation()
             return nil
         }
     }
@@ -293,17 +424,45 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.closeFocusedWindowAndDeleteNote()
+                self?.requestDeleteFocusedWindowConfirmation()
             }
         }
     }
 
-    private func closeFocusedWindowAndDeleteNote() {
-        if let keyWindow = NSApp.keyWindow as? BorderlessKeyWindow {
-            keyWindow.close()
-            return
+    private func requestDeleteFocusedWindowConfirmation() {
+        guard let window = focusedNoteWindow() else { return }
+        guard pendingDeleteConfirmationWindowIDs.contains(window.noteID) == false else { return }
+
+        pendingDeleteConfirmationWindowIDs.insert(window.noteID)
+
+        let alert = NSAlert()
+        alert.messageText = "Delete this note?"
+        alert.informativeText = "This will permanently delete the note."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Yes")
+        alert.addButton(withTitle: "No")
+        alert.buttons.first?.keyEquivalent = "\r"
+        alert.buttons.dropFirst().first?.keyEquivalent = "\u{1b}"
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            self.pendingDeleteConfirmationWindowIDs.remove(window.noteID)
+
+            guard response == .alertFirstButtonReturn else {
+                window.makeKeyAndOrderFront(nil)
+                return
+            }
+
+            window.close()
         }
-        noteWindows.values.first?.close()
+    }
+
+    private func focusedNoteWindow() -> BorderlessKeyWindow? {
+        if let keyWindow = NSApp.keyWindow as? BorderlessKeyWindow {
+            return keyWindow
+        }
+
+        return noteWindows.values.first
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -360,18 +519,52 @@ private struct NoPadCommands: Commands {
 @MainActor
 private struct NoteWindowView: View {
     let initialText: String
+    let onPinChange: (Bool) -> Void
     let onTextChange: (String) -> Void
+    @State private var isPinned: Bool
+
+    init(
+        initialText: String,
+        initialIsPinned: Bool,
+        onTextChange: @escaping (String) -> Void,
+        onPinChange: @escaping (Bool) -> Void
+    ) {
+        self.initialText = initialText
+        self.onTextChange = onTextChange
+        self.onPinChange = onPinChange
+        _isPinned = State(initialValue: initialIsPinned)
+    }
 
     var body: some View {
         ZStack {
             GlassSurface()
 
             VStack(spacing: 0) {
-                Capsule()
-                    .fill(Color(nsColor: Theme.cursor).opacity(0.6))
-                    .frame(width: 74, height: 6)
-                    .padding(.top, 14)
-                    .padding(.bottom, 18)
+                ZStack {
+                    Capsule()
+                        .fill(Color(nsColor: Theme.cursor).opacity(0.6))
+                        .frame(width: 74, height: 6)
+
+                    HStack {
+                        Spacer()
+
+                        Button {
+                            isPinned.toggle()
+                            onPinChange(isPinned)
+                        } label: {
+                            Image(systemName: isPinned ? "pin.fill" : "pin")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(pinForegroundStyle)
+                                .frame(width: 30, height: 30)
+                                .background(pinBackground)
+                        }
+                        .buttonStyle(.plain)
+                        .help(isPinned ? "Unpin note" : "Pin note on top")
+                    }
+                }
+                .padding(.top, 14)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 18)
 
                 MarkdownEditor(initialText: initialText, onTextChange: onTextChange)
                     .padding(.horizontal, 24)
@@ -390,6 +583,37 @@ private struct NoteWindowView: View {
         )
         .padding(12)
         .frame(minWidth: 700, minHeight: 460)
+    }
+
+    private var pinForegroundStyle: some ShapeStyle {
+        if isPinned {
+            return AnyShapeStyle(Color(nsColor: Theme.background).opacity(0.96))
+        }
+
+        return AnyShapeStyle(Color(nsColor: Theme.cursor).opacity(0.85))
+    }
+
+    private var pinBackground: some View {
+        Circle()
+            .fill(
+                isPinned
+                    ? Color(nsColor: Theme.accent).opacity(0.92)
+                    : Color.white.opacity(0.06)
+            )
+            .overlay(
+                Circle()
+                    .strokeBorder(
+                        isPinned
+                            ? Color.white.opacity(0.18)
+                            : Color.white.opacity(0.10),
+                        lineWidth: 0.8
+                    )
+            )
+            .shadow(
+                color: isPinned ? Color(nsColor: Theme.accent).opacity(0.32) : .clear,
+                radius: 10,
+                y: 2
+            )
     }
 }
 
